@@ -463,7 +463,7 @@ def say_text(text: str) -> None:
             tts_engine.say(text)
             tts_engine.runAndWait()
     except Exception as e:
-        print(f"TTS error: {e}")
+        logger.exception("TTS error: %s", e)
 
 
 def process_video_real_time(duration: int, exercise_type: str) -> int:
@@ -594,7 +594,7 @@ async def email_sender(email: str, feedback_content: str) -> dict:
         )
         return {"message": "Email sent successfully"}
     except Exception as e:
-        print(f"SMTP email failed: {e}")
+        logger.exception("SMTP email failed: %s", e)
         return {"message": "Failed to send email"}
 
 
@@ -636,33 +636,33 @@ async def video_process(
             shutil.copyfileobj(Video.file, buffer)
 
         try:
-            final_angle, exercise = analyze_exercise_form(temp_video_path, Exercise_type.lower())
-        except InvalidVideoFormatError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        except UnsupportedExerciseError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        except NoPoseDetectedError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        except VideoProcessingError as e:
-            raise HTTPException(status_code=500, detail="An internal error occurred while processing the video.") from e
+            try:
+                final_angle, exercise = analyze_exercise_form(temp_video_path, Exercise_type.lower())
+            except InvalidVideoFormatError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            except UnsupportedExerciseError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            except NoPoseDetectedError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            except VideoProcessingError as e:
+                raise HTTPException(status_code=500, detail="An internal error occurred while processing the video.") from e
 
-        feedback = chat_with_ai_video(final_angle, exercise)
-
-        os.remove(temp_video_path)
-
-        email_result = await email_sender(str(email), feedback)
-        return {
-            "feedback": feedback,
-            "message": "Uploaded video analysis complete.",
-            "email_status": email_result["message"],
-        }
+            feedback = chat_with_ai_video(final_angle, exercise)
+            email_result = await email_sender(str(email), feedback)
+            return {
+                "feedback": feedback,
+                "message": "Uploaded video analysis complete.",
+                "email_status": email_result["message"],
+            }
+        finally:
+            os.remove(temp_video_path)
 
     # 2) Real-time (webcam)
     if Duration_in_real_time and Duration_in_real_time > 0:
         try:
             good_count = process_video_real_time(Duration_in_real_time, Exercise_type.lower())
-        except HTTPException as e:
-            return {"message": e.detail}
+        except HTTPException:
+            raise
 
         ai_feedback = chat_with_ai_video_real_time(good_count, Duration_in_real_time, Exercise_type.lower())
         email_result = await email_sender(str(email), ai_feedback)
