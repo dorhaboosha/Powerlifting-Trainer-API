@@ -103,6 +103,10 @@ def calculate_bmi(height: float, weight: float) -> float:
     return round(weight / (height**2), 2)
 
 
+@app.get("/health_check")
+def health_check():
+    return {"status": "ok"}
+
 @app.post("/Registration")
 async def register_user(user: User):
     if user.email == "user@example.com":
