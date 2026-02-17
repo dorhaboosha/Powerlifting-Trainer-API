@@ -1,0 +1,40 @@
+trigger:
+- main
+
+resources:
+- repo: self
+
+variables:
+  # Container registry and image variables
+  ACR_REGISTRY: 'itaybirthday' # The name of your Azure Container Registry without the domain
+  IMAGE_NAME: 'name' # The repository name in your ACR where the image will be pushed
+  # Using Build ID as an incremental tag
+  IMAGE_TAG: '$(Build.BuildId)'
+
+  # Service connection names
+  dockerRegistryServiceConnection: 'DockerRegistryservice' # The name of your service connection for Docker
+  azureResourceManagerConnection: 'AzureResourceManager' # The name of your service connection for Azure Resource Manager
+
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
+
+stages:
+- stage: Build
+  displayName: 'Build stage'
+  jobs:
+  - job: Build
+    displayName: 'Build'
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - checkout: self
+    - task: Docker@2
+      displayName: 'Build and push Docker Image'
+      inputs:
+        command: buildAndPush
+        repository: $(IMAGE_NAME)
+        dockerfile: '$(Build.SourcesDirectory)/Dockerfile'
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(IMAGE_TAG)
+
