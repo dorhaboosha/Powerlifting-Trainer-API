@@ -24,9 +24,10 @@ This project was built as a **final project** for the course **Software Developm
 - Fetch profile by email
 - Update PR records
 
-### 🎥 Video Analysis
-- Upload an `.mp4` video → analyze form using MediaPipe + OpenCV → get AI feedback
+### 🎥 Video Analysis + Email Feedback
+- Upload an `.mp4` video → analyze form using MediaPipe + OpenCV → get AI coaching feedback
 - Real-time webcam mode (counts “good reps” + AI feedback)
+- send the generated feedback to the user by **email (SMTP)**
 
 ---
 
@@ -53,6 +54,78 @@ When the server is running, open:
 - **Health Check:** `http://localhost:8000/health_check`
 
 Root path redirects to `/docs`.
+
+---
+
+## 🔑 Environment Variables (.env)
+
+This project uses environment variables for API keys, email sending, and runtime paths.
+
+### 1) Create `.env`
+Create a `.env` file in the project root (based on `.env.example`) and fill the values.
+
+### 2) Variables explained
+
+#### OpenAI
+- `OPENAI_API_KEY`  
+  Your OpenAI API key. **Required** for generating the coaching feedback text.
+
+#### Email (SMTP) – optional
+Used to email the feedback to the user after video analysis.  
+If SMTP variables are missing/invalid, the API will still run, but the response will show an email status like **"Failed to send email"** or a “missing SMTP” message.
+
+- `SMTP_HOST`  
+  SMTP server hostname (for Gmail: `smtp.gmail.com`)
+- `SMTP_PORT`  
+  SMTP port (commonly `587` for STARTTLS)
+- `SMTP_USER`  
+  SMTP username (usually your email address)
+- `SMTP_PASS`  
+  SMTP password / **App Password** (Gmail often requires an App Password, not your regular password)
+- `SMTP_FROM_NAME`  
+  The display name shown in the “From” field (e.g., `Powerlifting Coach`)
+
+#### Runtime / Paths
+- `RUNNING_IN_DOCKER`  
+  Set to `1` when running in Docker. This disables UI/webcam behavior and switches to Docker-friendly paths.
+- `DB_PATH`  
+  Path to the SQLite database file.
+  - Local example: `Users.db`
+  - Docker example: `/data/Users.db` (recommended with a mounted volume)
+- `UPLOAD_DIR`  
+  Temp folder where uploaded videos are stored before analysis.
+  - Local example: `./tmp_uploads`
+  - Docker example: `/tmp/uploads`
+
+### Example `.env` (local)
+```env
+OPENAI_API_KEY=your_openai_key_here
+
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your_email@gmail.com
+SMTP_PASS=your_app_password
+SMTP_FROM_NAME=Powerlifting Coach
+
+RUNNING_IN_DOCKER=0
+DB_PATH=Users.db
+UPLOAD_DIR=./tmp_uploads
+```
+
+### Example `.env` (Docker)
+```env
+OPENAI_API_KEY=your_openai_key_here
+
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your_email@gmail.com
+SMTP_PASS=your_app_password
+SMTP_FROM_NAME=Powerlifting Coach
+
+RUNNING_IN_DOCKER=1
+DB_PATH=/data/Users.db
+UPLOAD_DIR=/tmp/uploads
+```
 
 ---
 
@@ -118,7 +191,7 @@ Open: `http://localhost:8000/docs`
 You will get the friendly message telling you to upload a video instead.
 
 > **Windows PowerShell volume tip:**  
-> Replace `-v $(pwd)/data:/data` with `-v ${PWD}\data:/data`
+> Replace `-v $(pwd)/data:/data` with `-v ${PWD}\\data:/data`
 
 ---
 
