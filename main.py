@@ -14,6 +14,8 @@ import os
 # ✅ Must be set BEFORE importing mediapipe (prevents EGL/GL GPU issues)
 os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
 
+import html
+import logging
 import time
 import threading
 import shutil
@@ -22,6 +24,8 @@ import json
 import webbrowser
 from email.message import EmailMessage
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 import cv2
 import numpy as np
@@ -386,7 +390,8 @@ def analyze_exercise_form(video_path: str, exercise_type: str):
                             break
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred during video processing: {e}")
+        logger.exception("Video processing failed: %s", e)
+        raise HTTPException(status_code=500, detail="An internal error occurred while processing the video.")
 
     finally:
         cap.release()
@@ -543,11 +548,12 @@ async def email_sender(email: str, feedback_content: str) -> dict:
     msg["Subject"] = "Your Feedback on your exercise"
 
     msg.set_content(f"Your feedback:\n\n{feedback_content}")
+    safe_content = html.escape(feedback_content, quote=True)
     msg.add_alternative(
         f"""
         <div>
             <p><strong>Your feedback on your exercise is:</strong></p>
-            <p>{feedback_content}</p>
+            <p>{safe_content}</p>
         </div>
         """,
         subtype="html",

@@ -45,7 +45,7 @@ client = TestClient(app)
 
 
 @pytest.fixture
-def mock_db_connection(mocker):  # noqa: ARG001
+def mock_db_connection(mocker):
     """Patch main.get_db_connection so tests use a mock connection instead of a real DB."""
     mocker.patch("main.get_db_connection", return_value=MagicMock(spec=sqlite3.Connection))
 
@@ -82,10 +82,8 @@ def post_cleanup():
     conn.close()
 
 
-def test_register_user():
-    """POST /Registration with valid payload creates user and returns welcome message."""
-    pre_cleanup()
-
+def test_register_user(mock_db_connection):
+    """POST /Registration with valid payload creates user and returns welcome message (uses mocked DB)."""
     response = client.post(
         "/Registration",
         json={
@@ -98,8 +96,6 @@ def test_register_user():
 
     assert response.status_code == 200
     assert response.json()["message"] == "Welcome to our exercise program"
-
-    post_cleanup()
 
 
 def test_get_user_not_found():
