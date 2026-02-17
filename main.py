@@ -389,9 +389,9 @@ def analyze_exercise_form(video_path: str, exercise_type: str):
                         if cv2.waitKey(1) & 0xFF == ord("q"):
                             break
 
-    except Exception as e:
-        logger.exception("Video processing failed: %s", e)
-        raise HTTPException(status_code=500, detail="An internal error occurred while processing the video.")
+    except Exception:
+        logger.exception("Video processing failed")
+        raise HTTPException(status_code=500, detail="An internal error occurred while processing the video.") from None
 
     finally:
         cap.release()

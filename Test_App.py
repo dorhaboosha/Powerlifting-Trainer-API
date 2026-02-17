@@ -244,7 +244,8 @@ def test_process_video_real_time(
     mock_draw_landmarks.side_effect = lambda *args, **kwargs: None
 
     mock_VideoCapture_instance = mock_VideoCapture.return_value
-    mock_VideoCapture_instance.isOpened.return_value = True
+    # Exit after one iteration so the test does not depend on real wall-clock time
+    mock_VideoCapture_instance.isOpened.side_effect = [True, False]
     mock_frame = MagicMock()
     mock_frame.shape = (100, 100, 3)
     mock_VideoCapture_instance.read.return_value = (True, mock_frame)
