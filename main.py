@@ -11,6 +11,7 @@ import shutil
 from dotenv import load_dotenv
 from openai import OpenAI
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, EmailStr
 import sqlite3
 import json
@@ -102,6 +103,10 @@ class User(BaseModel):
 def calculate_bmi(height: float, weight: float) -> float:
     return round(weight / (height**2), 2)
 
+
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/docs")
 
 @app.get("/health_check")
 def health_check():
