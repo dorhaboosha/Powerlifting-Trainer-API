@@ -299,7 +299,7 @@ mp_drawing = mp.solutions.drawing_utils
 
 
 def calculate_angle(a, b, c) -> float:
-    """Compute the angle at point b formed by segments (a–b) and (b–c), in degrees."""
+    """Compute the angle at point b formed by segments (a-b) and (b-c), in degrees."""
     a = np.array(a)
     b = np.array(b)
     c = np.array(c)
@@ -313,7 +313,7 @@ def calculate_angle(a, b, c) -> float:
 
 
 def analyze_squat(landmarks) -> float:
-    """Compute knee angle (hip–knee–ankle) for squat form from MediaPipe pose landmarks."""
+    """Compute knee angle (hip-knee-ankle) for squat form from MediaPipe pose landmarks."""
     hip = [landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x, landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y]
     knee = [landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].x, landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].y]
     ankle = [landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].x, landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].y]
@@ -321,7 +321,7 @@ def analyze_squat(landmarks) -> float:
 
 
 def analyze_deadlift(landmarks) -> float:
-    """Compute hip angle (shoulder–hip–knee) for deadlift form from MediaPipe pose landmarks."""
+    """Compute hip angle (shoulder-hip-knee) for deadlift form from MediaPipe pose landmarks."""
     shoulder = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x, landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y]
     hip = [landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x, landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y]
     knee = [landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].x, landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].y]
@@ -329,7 +329,7 @@ def analyze_deadlift(landmarks) -> float:
 
 
 def analyze_benchpress(landmarks) -> float:
-    """Compute elbow angle (wrist–elbow–shoulder) for bench press form from MediaPipe pose landmarks."""
+    """Compute elbow angle (wrist-elbow-shoulder) for bench press form from MediaPipe pose landmarks."""
     wrist = [landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].x, landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].y]
     elbow = [landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].x, landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].y]
     shoulder = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x, landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y]
