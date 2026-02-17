@@ -1,3 +1,14 @@
+"""
+Pytest suite for the Powerlifting Trainer Assistant API.
+
+Covers:
+- DB connection and user registration/profile/records
+- BMI and pose angle helpers (calculate_angle, analyze_squat/deadlift/benchpress)
+- Video form analysis and OpenAI coaching (mocked)
+- TTS and real-time webcam flow (mocked)
+- Email sender behavior (mocked)
+"""
+
 from dotenv import load_dotenv
 from fastapi.testclient import TestClient
 import pytest
@@ -9,7 +20,6 @@ import json
 
 from main import (
     app,
-    get_db_connection,
     calculate_bmi,
     analyze_squat,
     analyze_exercise_form,
@@ -20,7 +30,9 @@ from main import (
     say_text,
     email_sender,
     calculate_angle,
-    update_weight,
+    update_user_records,
+    InvalidVideoFormatError,
+    UnsupportedExerciseError,
 )
 
 load_dotenv()
@@ -28,17 +40,26 @@ load_dotenv()
 client = TestClient(app)
 
 
+# -------------------------
+# DB and app client
+# -------------------------
+
+
 @pytest.fixture
 def mock_db_connection(mocker):
-    mocker.patch("sqlite3.connect", return_value=MagicMock(sqlite3.Connection))
+    """Patch main.get_db_connection so tests use a mock connection instead of a real DB."""
+    mocker.patch("main.get_db_connection", return_value=MagicMock(spec=sqlite3.Connection))
 
 
 def test_get_db_connection(mock_db_connection):
-    conn = get_db_connection()
+    """get_db_connection returns a non-None connection (mock when patched)."""
+    conn = main.get_db_connection()
     assert conn is not None
+    main.get_db_connection.assert_called_once()
 
 
 def test_calculate_bmi():
+    """BMI for height 1.75 m and weight 75 kg is 24.49."""
     height = 1.75
     weight = 75
     expected_bmi = 24.49
@@ -46,25 +67,8 @@ def test_calculate_bmi():
     assert bmi == expected_bmi
 
 
-def pre_cleanup():
-    """Ensure the test user does not exist before running the test."""
-    conn = get_db_connection()
-    conn.execute("DELETE FROM Users WHERE email = ?", ("test@example.com",))
-    conn.commit()
-    conn.close()
-
-
-def post_cleanup():
-    """Delete the test user after the test."""
-    conn = get_db_connection()
-    conn.execute("DELETE FROM Users WHERE email = ?", ("test@example.com",))
-    conn.commit()
-    conn.close()
-
-
-def test_register_user():
-    pre_cleanup()
-
+def test_register_user(mock_db_connection):
+    """POST /Registration with valid payload creates user and returns welcome message (uses mocked DB)."""
     response = client.post(
         "/Registration",
         json={
@@ -78,16 +82,16 @@ def test_register_user():
     assert response.status_code == 200
     assert response.json()["message"] == "Welcome to our exercise program"
 
-    post_cleanup()
-
 
 def test_get_user_not_found():
+    """GET /Show User for unknown email returns 404."""
     test_email = "NotExists@example.com"
     response = client.get(f"/Show User?user_email={test_email}")
     assert response.status_code == 404
 
 
 def test_calculate_angle_degrees():
+    """Angle at (1,0) between (0,0)-(1,0) and (1,0)-(1,1) is 90 degrees."""
     a = [0, 0]
     b = [1, 0]
     c = [1, 1]
@@ -98,6 +102,7 @@ def test_calculate_angle_degrees():
 
 
 def mock_landmark(x, y):
+    """Build a MagicMock pose landmark with .x and .y for angle tests."""
     lm = MagicMock()
     lm.x = x
     lm.y = y
@@ -105,6 +110,7 @@ def mock_landmark(x, y):
 
 
 def test_analyze_squat():
+    """analyze_squat(landmarks) matches manual calculate_angle(hip, knee, ankle)."""
     hip = mock_landmark(0.5, 0.5)
     knee = mock_landmark(0.5, 0.6)
     ankle = mock_landmark(0.5, 0.7)
@@ -121,6 +127,7 @@ def test_analyze_squat():
 
 
 def test_analyze_deadlift():
+    """analyze_deadlift(landmarks) matches manual calculate_angle(shoulder, hip, knee)."""
     shoulder = mock_landmark(0.5, 0.4)
     hip = mock_landmark(0.5, 0.5)
     knee = mock_landmark(0.5, 0.6)
@@ -137,6 +144,7 @@ def test_analyze_deadlift():
 
 
 def test_analyze_benchpress():
+    """analyze_benchpress(landmarks) matches manual calculate_angle(wrist, elbow, shoulder)."""
     wrist = mock_landmark(0.4, 0.5)
     elbow = mock_landmark(0.5, 0.5)
     shoulder = mock_landmark(0.6, 0.5)
@@ -154,6 +162,7 @@ def test_analyze_benchpress():
 
 @pytest.fixture
 def mock_openai_client(mocker):
+    """Patch OpenAI chat completions to return a fixed 'Mocked AI response'."""
     mocker.patch(
         "main.client.chat.completions.create",
         return_value=MagicMock(choices=[MagicMock(message=MagicMock(content="Mocked AI response"))]),
@@ -161,30 +170,30 @@ def mock_openai_client(mocker):
 
 
 def test_analyze_exercise_form_invalid_input(mock_openai_client):
-    with pytest.raises(HTTPException) as e:
+    """analyze_exercise_form raises domain errors for None video or unsupported exercise type."""
+    with pytest.raises(InvalidVideoFormatError) as e:
         analyze_exercise_form(None, "squat")
-    assert e.value.status_code == 400
-    assert "Invalid video format" in str(e.value.detail)
+    assert "Invalid video format" in str(e.value)
 
-    with pytest.raises(HTTPException) as e2:
+    with pytest.raises(UnsupportedExerciseError):
         analyze_exercise_form("video.mp4", "unsupported_exercise")
-    assert e2.value.status_code == 400
 
 
 def test_chat_with_ai_video(mock_openai_client):
+    """chat_with_ai_video returns the mocked OpenAI response."""
     final_angle = 45
     exercise_type = "squat"
     response = chat_with_ai_video(final_angle, exercise_type)
     assert response == "Mocked AI response"
 
 
-@patch("pyttsx3.init")
-def test_say_text(mock_init):
+@patch("main.tts_engine")
+def test_say_text(mock_tts_engine):
+    """say_text calls the module-level tts_engine say and runAndWait with the given text."""
     text = "This is a test message."
     say_text(text)
-    mock_init.assert_called_once()
-    mock_init.return_value.say.assert_called_once_with(text)
-    mock_init.return_value.runAndWait.assert_called_once()
+    mock_tts_engine.say.assert_called_once_with(text)
+    mock_tts_engine.runAndWait.assert_called_once()
 
 
 @patch("main.mp_drawing.draw_landmarks")
@@ -206,22 +215,29 @@ def test_process_video_real_time(
     mock_cvtColor,
     mock_putText,
     mock_draw_landmarks,
+    monkeypatch,
 ):
+    """With VideoCapture/Pose/cv2 mocked, process_video_real_time runs and uses capture, pose, draw, and cleanup."""
+    # Force local mode for this test, regardless of your real .env
+    monkeypatch.setattr(main, "RUNNING_IN_DOCKER", False)
+
     mock_calculate_angle.return_value = 45.0
 
     mock_putText.side_effect = lambda *args, **kwargs: None
     mock_draw_landmarks.side_effect = lambda *args, **kwargs: None
 
     mock_VideoCapture_instance = mock_VideoCapture.return_value
-    mock_VideoCapture_instance.isOpened.return_value = True
+    # Exit after one iteration so the test does not depend on real wall-clock time
+    mock_VideoCapture_instance.isOpened.side_effect = [True, False]
     mock_frame = MagicMock()
     mock_frame.shape = (100, 100, 3)
     mock_VideoCapture_instance.read.return_value = (True, mock_frame)
 
     mock_results = MagicMock()
     mock_results.pose_landmarks.landmark = [MagicMock() for _ in range(33)]
-    mock_Pose.return_value.process.return_value = mock_results
-    mock_Pose.return_value.POSE_CONNECTIONS = [(15, 21)]
+    mock_pose_instance = mock_Pose.return_value.__enter__.return_value
+    mock_pose_instance.process.return_value = mock_results
+    mock_pose_instance.POSE_CONNECTIONS = [(15, 21)]
 
     duration = 1
     exercise_type = "squat"
@@ -230,6 +246,7 @@ def test_process_video_real_time(
     assert count == 0
     assert mock_VideoCapture_instance.isOpened.called
     assert mock_VideoCapture_instance.read.called
+    mock_VideoCapture_instance.release.assert_called_once()
     assert mock_Pose.called
     assert mock_destroyAllWindows.called
     assert mock_cvtColor.called
@@ -237,81 +254,90 @@ def test_process_video_real_time(
     assert mock_draw_landmarks.called
 
 
+def test_process_video_real_time_blocks_in_docker(monkeypatch):
+    """When RUNNING_IN_DOCKER=True, real-time webcam flow is blocked with a friendly 400."""
+    monkeypatch.setattr(main, "RUNNING_IN_DOCKER", True)
+    with pytest.raises(HTTPException) as e:
+        main.process_video_real_time(1, "squat")
+    assert e.value.status_code == 400
+    assert "webcam" in e.value.detail.lower() or "connection" in e.value.detail.lower()
+
+
 # -------------------------
-# ✅ Email tests for Resend (testing mode)
+# Email tests (main uses aiosmtplib.send + SMTP_*)
 # -------------------------
-@patch("main.resend.Emails.send")
-def test_email_sender_success(mock_send, monkeypatch):
-    monkeypatch.setattr(main, "RESEND_API_KEY", "re_test_key")
-    monkeypatch.setattr(main, "RESEND_FROM", "Acme <onboarding@resend.dev>")
 
-    # ✅ Make the test deterministic (don’t rely on your real .env)
-    monkeypatch.setenv("RESEND_TEST_TO", "test@example.com")
 
-    mock_send.return_value = {"id": "email_123"}
+@pytest.mark.asyncio
+@patch("main.aiosmtplib.send")
+async def test_email_sender_success(mock_send, monkeypatch):
+    """With aiosmtplib.send mocked and SMTP credentials set, email_sender returns success and send is called."""
+    monkeypatch.setattr(main, "SMTP_USER", "test@example.com")
+    monkeypatch.setattr(main, "SMTP_PASS", "testpass")
 
-    email = "test@example.com"
+    mock_send.return_value = None
+
+    email = "recipient@example.com"
     feedback_content = "This is a test feedback"
-    result = email_sender(email, feedback_content)
+    result = await email_sender(email, feedback_content)
 
     assert result == {"message": "Email sent successfully"}
+    mock_send.assert_called_once()
+    call_kw = mock_send.call_args[1]
+    assert call_kw["hostname"] == main.SMTP_HOST
+    assert call_kw["username"] == "test@example.com"
+    msg = mock_send.call_args[0][0]
+    assert msg["To"] == email
+    assert msg["Subject"] == "Your Feedback on your exercise"
+    assert feedback_content in str(msg)
 
-    args, _ = mock_send.call_args
-    sent_payload = args[0]
 
-    assert sent_payload["from"] == "Acme <onboarding@resend.dev>"
-    assert sent_payload["to"] == [email]
-    assert sent_payload["subject"] == "Your Feedback on your exercise"
-    assert "This is a test feedback" in sent_payload["html"]
-
-
-@patch("main.resend.Emails.send")
-def test_email_sender_failure(mock_send, monkeypatch):
-    monkeypatch.setattr(main, "RESEND_API_KEY", "re_test_key")
-    monkeypatch.setattr(main, "RESEND_FROM", "Acme <onboarding@resend.dev>")
-
-    # ✅ Allow this recipient in testing mode
-    monkeypatch.setenv("RESEND_TEST_TO", "test@example.com")
-
-    mock_send.return_value = {}  # no id => failure
+@pytest.mark.asyncio
+@patch("main.aiosmtplib.send")
+async def test_email_sender_failure(mock_send, monkeypatch):
+    """When aiosmtplib.send raises, email_sender returns failure message."""
+    monkeypatch.setattr(main, "SMTP_USER", "test@example.com")
+    monkeypatch.setattr(main, "SMTP_PASS", "testpass")
+    mock_send.side_effect = Exception("SMTP error")
 
     email = "test@example.com"
     feedback_content = "This is a test feedback"
-    result = email_sender(email, feedback_content)
+    result = await email_sender(email, feedback_content)
 
     assert result == {"message": "Failed to send email"}
 
 
-@patch("main.resend.Emails.send")
-def test_email_sender_blocks_non_test_recipient(mock_send, monkeypatch):
-    monkeypatch.setattr(main, "RESEND_API_KEY", "re_test_key")
-    monkeypatch.setattr(main, "RESEND_FROM", "Acme <onboarding@resend.dev>")
+@pytest.mark.asyncio
+async def test_email_sender_missing_credentials(monkeypatch):
+    """When SMTP_USER or SMTP_PASS is missing, email_sender returns without calling aiosmtplib.send."""
+    with patch("main.aiosmtplib.send") as mock_send:
+        monkeypatch.setattr(main, "SMTP_USER", None)
+        monkeypatch.setattr(main, "SMTP_PASS", "x")
 
-    # Only this is allowed
-    monkeypatch.setenv("RESEND_TEST_TO", "allowed@example.com")
+        result = await email_sender("test@example.com", "feedback")
 
-    email = "not-allowed@example.com"
-    feedback_content = "This is a test feedback"
-    result = email_sender(email, feedback_content)
-
-    assert result["message"].startswith("Email not sent.")
-    mock_send.assert_not_called()
+        assert result["message"].startswith("Email not sent")
+        mock_send.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_update_weight_success(mocker):
+async def test_update_user_records_success(mocker):
+    """update_user_records with valid user and new PRs updates DB and returns success."""
     conn_mock = mocker.MagicMock()
     mocker.patch("main.get_db_connection", return_value=conn_mock)
 
     email = "test@example.com"
     user_row = {"email": email, "squat": "[]", "bench_press": "[]", "deadlift": "[]"}
-    conn_mock.execute.return_value.fetchone.return_value = user_row
+    select_cursor = mocker.MagicMock()
+    select_cursor.fetchone.return_value = user_row
+    update_cursor = mocker.MagicMock()
+    conn_mock.execute.side_effect = [select_cursor, update_cursor]
 
     new_squat = 100.0
     new_bench_press = 150.0
     new_deadlift = 200.0
 
-    response = await update_weight(
+    response = await update_user_records(
         email=email,
         new_squat=new_squat,
         new_bench_press=new_bench_press,

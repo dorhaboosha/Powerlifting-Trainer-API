@@ -1,8 +1,21 @@
+"""
+Powerlifting Trainer Assistant API — main application module.
+
+This module provides a FastAPI backend that:
+- Manages lifter profiles (registration, BMI, PR history for squat/bench/deadlift).
+- Analyzes exercise form via uploaded video or real-time webcam using MediaPipe.
+- Returns AI coaching feedback via OpenAI and optionally emails it via SMTP.
+
+Important: Real-time webcam analysis works only when running locally (not in Docker).
+"""
+
 import os
 
 # ✅ Must be set BEFORE importing mediapipe (prevents EGL/GL GPU issues)
 os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
 
+import html
+import logging
 import time
 import threading
 import shutil
@@ -11,6 +24,8 @@ import json
 import webbrowser
 from email.message import EmailMessage
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 import cv2
 import numpy as np
@@ -281,6 +296,27 @@ async def update_user_records(
 
 
 # ============================================================
+# Video analysis domain exceptions (mapped to HTTP by routes)
+# ============================================================
+
+
+class InvalidVideoFormatError(Exception):
+    """Raised when video path is None or not .mp4."""
+
+
+class UnsupportedExerciseError(Exception):
+    """Raised when exercise_type is not squat, deadlift, or benchpress."""
+
+
+class NoPoseDetectedError(Exception):
+    """Raised when no pose landmarks are detected in the video."""
+
+
+class VideoProcessingError(Exception):
+    """Raised when an error occurs during video processing (e.g. OpenCV/MediaPipe)."""
+
+
+# ============================================================
 # ✅ MediaPipe / Analysis helpers
 # ============================================================
 mp_pose = mp.solutions.pose
@@ -288,6 +324,7 @@ mp_drawing = mp.solutions.drawing_utils
 
 
 def calculate_angle(a, b, c) -> float:
+    """Compute the angle at point b formed by segments (a-b) and (b-c), in degrees."""
     a = np.array(a)
     b = np.array(b)
     c = np.array(c)
@@ -301,6 +338,7 @@ def calculate_angle(a, b, c) -> float:
 
 
 def analyze_squat(landmarks) -> float:
+    """Compute knee angle (hip-knee-ankle) for squat form from MediaPipe pose landmarks."""
     hip = [landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x, landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y]
     knee = [landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].x, landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].y]
     ankle = [landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].x, landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].y]
@@ -308,6 +346,7 @@ def analyze_squat(landmarks) -> float:
 
 
 def analyze_deadlift(landmarks) -> float:
+    """Compute hip angle (shoulder-hip-knee) for deadlift form from MediaPipe pose landmarks."""
     shoulder = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x, landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y]
     hip = [landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x, landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y]
     knee = [landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].x, landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].y]
@@ -315,6 +354,7 @@ def analyze_deadlift(landmarks) -> float:
 
 
 def analyze_benchpress(landmarks) -> float:
+    """Compute elbow angle (wrist-elbow-shoulder) for bench press form from MediaPipe pose landmarks."""
     wrist = [landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].x, landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].y]
     elbow = [landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].x, landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].y]
     shoulder = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x, landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y]
@@ -322,10 +362,17 @@ def analyze_benchpress(landmarks) -> float:
 
 
 def analyze_exercise_form(video_path: str, exercise_type: str):
+    """
+    Run pose detection on an .mp4 file and return a representative angle for the given exercise.
+
+    Supported exercise_type: "squat", "deadlift", "benchpress".
+    Returns (angle, exercise_type); for squat/benchpress returns min angle, for deadlift returns mean.
+    Raises InvalidVideoFormatError, UnsupportedExerciseError, NoPoseDetectedError, or VideoProcessingError.
+    """
     if video_path is None or not video_path.lower().endswith(".mp4"):
-        raise HTTPException(status_code=400, detail="Invalid video format, please upload an .mp4 file.")
+        raise InvalidVideoFormatError("Invalid video format, please upload an .mp4 file.")
     if exercise_type not in ["squat", "deadlift", "benchpress"]:
-        raise HTTPException(status_code=400, detail="Unsupported exercise type")
+        raise UnsupportedExerciseError("Unsupported exercise type")
 
     cap = cv2.VideoCapture(video_path)
     angles = []
@@ -364,8 +411,11 @@ def analyze_exercise_form(video_path: str, exercise_type: str):
                         if cv2.waitKey(1) & 0xFF == ord("q"):
                             break
 
+    except (InvalidVideoFormatError, UnsupportedExerciseError, NoPoseDetectedError):
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred during video processing: {e}")
+        logger.exception("Video processing failed")
+        raise VideoProcessingError("An error occurred during video processing.") from e
 
     finally:
         cap.release()
@@ -373,7 +423,7 @@ def analyze_exercise_form(video_path: str, exercise_type: str):
             cv2.destroyAllWindows()
 
     if not saw_pose:
-        raise HTTPException(status_code=400, detail="No pose landmarks detected in the video. Please upload a clearer video.")
+        raise NoPoseDetectedError("No pose landmarks detected in the video. Please upload a clearer video.")
 
     if exercise_type == "squat":
         return min_angle_squat, exercise_type
@@ -383,6 +433,7 @@ def analyze_exercise_form(video_path: str, exercise_type: str):
 
 
 def chat_with_ai_video(final_angle: float, exercise_type: str) -> str:
+    """Request OpenAI coaching feedback for the given measured angle and exercise type."""
     prompt = (
         f"I analyzed your {exercise_type} form.\n"
         f"Measured angle: {final_angle:.2f} degrees.\n"
@@ -406,12 +457,13 @@ def chat_with_ai_video(final_angle: float, exercise_type: str) -> str:
 
 
 def say_text(text: str) -> None:
+    """Speak the given text using TTS (thread-safe via tts_lock)."""
     try:
         with tts_lock:
             tts_engine.say(text)
             tts_engine.runAndWait()
     except Exception as e:
-        print(f"TTS error: {e}")
+        logger.exception("TTS error: %s", e)
 
 
 def process_video_real_time(duration: int, exercise_type: str) -> int:
@@ -520,11 +572,12 @@ async def email_sender(email: str, feedback_content: str) -> dict:
     msg["Subject"] = "Your Feedback on your exercise"
 
     msg.set_content(f"Your feedback:\n\n{feedback_content}")
+    safe_content = html.escape(feedback_content, quote=True)
     msg.add_alternative(
         f"""
         <div>
             <p><strong>Your feedback on your exercise is:</strong></p>
-            <p>{feedback_content}</p>
+            <p>{safe_content}</p>
         </div>
         """,
         subtype="html",
@@ -541,11 +594,12 @@ async def email_sender(email: str, feedback_content: str) -> dict:
         )
         return {"message": "Email sent successfully"}
     except Exception as e:
-        print(f"SMTP email failed: {e}")
+        logger.exception("SMTP email failed: %s", e)
         return {"message": "Failed to send email"}
 
 
 def chat_with_ai_video_real_time(good_count: int, duration: int, exercise_type: str) -> str:
+    """Request OpenAI feedback based on rep count and duration from real-time webcam analysis."""
     chat_completion = client.chat.completions.create(
         messages=[
             {"role": "system", "content": "You are a professional powerlifting and strength training coach."},
@@ -581,24 +635,34 @@ async def video_process(
         with open(temp_video_path, "wb") as buffer:
             shutil.copyfileobj(Video.file, buffer)
 
-        final_angle, exercise = analyze_exercise_form(temp_video_path, Exercise_type.lower())
-        feedback = chat_with_ai_video(final_angle, exercise)
+        try:
+            try:
+                final_angle, exercise = analyze_exercise_form(temp_video_path, Exercise_type.lower())
+            except InvalidVideoFormatError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            except UnsupportedExerciseError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            except NoPoseDetectedError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            except VideoProcessingError as e:
+                raise HTTPException(status_code=500, detail="An internal error occurred while processing the video.") from e
 
-        os.remove(temp_video_path)
-
-        email_result = await email_sender(str(email), feedback)
-        return {
-            "feedback": feedback,
-            "message": "Uploaded video analysis complete.",
-            "email_status": email_result["message"],
-        }
+            feedback = chat_with_ai_video(final_angle, exercise)
+            email_result = await email_sender(str(email), feedback)
+            return {
+                "feedback": feedback,
+                "message": "Uploaded video analysis complete.",
+                "email_status": email_result["message"],
+            }
+        finally:
+            os.remove(temp_video_path)
 
     # 2) Real-time (webcam)
     if Duration_in_real_time and Duration_in_real_time > 0:
         try:
             good_count = process_video_real_time(Duration_in_real_time, Exercise_type.lower())
-        except HTTPException as e:
-            return {"message": e.detail}
+        except HTTPException:
+            raise
 
         ai_feedback = chat_with_ai_video_real_time(good_count, Duration_in_real_time, Exercise_type.lower())
         email_result = await email_sender(str(email), ai_feedback)
@@ -652,10 +716,11 @@ async def old_video_processing(
 
 
 if __name__ == "__main__":
+    # Bind to all interfaces in Docker, localhost when running locally
     host = "0.0.0.0" if RUNNING_IN_DOCKER else "127.0.0.1"
     port = 8000
 
-    # ✅ Auto-open docs only when running locally (not Docker)
+    # Auto-open Swagger docs in browser when running locally (not Docker)
     if not RUNNING_IN_DOCKER:
         threading.Timer(1.0, lambda: webbrowser.open(f"http://{host}:{port}/docs")).start()
 
