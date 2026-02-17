@@ -296,6 +296,27 @@ async def update_user_records(
 
 
 # ============================================================
+# Video analysis domain exceptions (mapped to HTTP by routes)
+# ============================================================
+
+
+class InvalidVideoFormatError(Exception):
+    """Raised when video path is None or not .mp4."""
+
+
+class UnsupportedExerciseError(Exception):
+    """Raised when exercise_type is not squat, deadlift, or benchpress."""
+
+
+class NoPoseDetectedError(Exception):
+    """Raised when no pose landmarks are detected in the video."""
+
+
+class VideoProcessingError(Exception):
+    """Raised when an error occurs during video processing (e.g. OpenCV/MediaPipe)."""
+
+
+# ============================================================
 # ✅ MediaPipe / Analysis helpers
 # ============================================================
 mp_pose = mp.solutions.pose
@@ -346,11 +367,12 @@ def analyze_exercise_form(video_path: str, exercise_type: str):
 
     Supported exercise_type: "squat", "deadlift", "benchpress".
     Returns (angle, exercise_type); for squat/benchpress returns min angle, for deadlift returns mean.
+    Raises InvalidVideoFormatError, UnsupportedExerciseError, NoPoseDetectedError, or VideoProcessingError.
     """
     if video_path is None or not video_path.lower().endswith(".mp4"):
-        raise HTTPException(status_code=400, detail="Invalid video format, please upload an .mp4 file.")
+        raise InvalidVideoFormatError("Invalid video format, please upload an .mp4 file.")
     if exercise_type not in ["squat", "deadlift", "benchpress"]:
-        raise HTTPException(status_code=400, detail="Unsupported exercise type")
+        raise UnsupportedExerciseError("Unsupported exercise type")
 
     cap = cv2.VideoCapture(video_path)
     angles = []
@@ -389,9 +411,11 @@ def analyze_exercise_form(video_path: str, exercise_type: str):
                         if cv2.waitKey(1) & 0xFF == ord("q"):
                             break
 
-    except Exception:
+    except (InvalidVideoFormatError, UnsupportedExerciseError, NoPoseDetectedError):
+        raise
+    except Exception as e:
         logger.exception("Video processing failed")
-        raise HTTPException(status_code=500, detail="An internal error occurred while processing the video.") from None
+        raise VideoProcessingError("An error occurred during video processing.") from e
 
     finally:
         cap.release()
@@ -399,7 +423,7 @@ def analyze_exercise_form(video_path: str, exercise_type: str):
             cv2.destroyAllWindows()
 
     if not saw_pose:
-        raise HTTPException(status_code=400, detail="No pose landmarks detected in the video. Please upload a clearer video.")
+        raise NoPoseDetectedError("No pose landmarks detected in the video. Please upload a clearer video.")
 
     if exercise_type == "squat":
         return min_angle_squat, exercise_type
@@ -611,7 +635,17 @@ async def video_process(
         with open(temp_video_path, "wb") as buffer:
             shutil.copyfileobj(Video.file, buffer)
 
-        final_angle, exercise = analyze_exercise_form(temp_video_path, Exercise_type.lower())
+        try:
+            final_angle, exercise = analyze_exercise_form(temp_video_path, Exercise_type.lower())
+        except InvalidVideoFormatError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except UnsupportedExerciseError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except NoPoseDetectedError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except VideoProcessingError as e:
+            raise HTTPException(status_code=500, detail="An internal error occurred while processing the video.") from e
+
         feedback = chat_with_ai_video(final_angle, exercise)
 
         os.remove(temp_video_path)

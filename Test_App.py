@@ -20,7 +20,6 @@ import json
 
 from main import (
     app,
-    get_db_connection,
     calculate_bmi,
     analyze_squat,
     analyze_exercise_form,
@@ -32,6 +31,8 @@ from main import (
     email_sender,
     calculate_angle,
     update_user_records,
+    InvalidVideoFormatError,
+    UnsupportedExerciseError,
 )
 
 load_dotenv()
@@ -64,22 +65,6 @@ def test_calculate_bmi():
     expected_bmi = 24.49
     bmi = calculate_bmi(height, weight)
     assert bmi == expected_bmi
-
-
-def pre_cleanup():
-    """Ensure the test user does not exist before running the test."""
-    conn = get_db_connection()
-    conn.execute("DELETE FROM Users WHERE email = ?", ("test@example.com",))
-    conn.commit()
-    conn.close()
-
-
-def post_cleanup():
-    """Delete the test user after the test."""
-    conn = get_db_connection()
-    conn.execute("DELETE FROM Users WHERE email = ?", ("test@example.com",))
-    conn.commit()
-    conn.close()
 
 
 def test_register_user(mock_db_connection):
@@ -185,15 +170,13 @@ def mock_openai_client(mocker):
 
 
 def test_analyze_exercise_form_invalid_input(mock_openai_client):
-    """analyze_exercise_form raises 400 for None video or unsupported exercise type."""
-    with pytest.raises(HTTPException) as e:
+    """analyze_exercise_form raises domain errors for None video or unsupported exercise type."""
+    with pytest.raises(InvalidVideoFormatError) as e:
         analyze_exercise_form(None, "squat")
-    assert e.value.status_code == 400
-    assert "Invalid video format" in str(e.value.detail)
+    assert "Invalid video format" in str(e.value)
 
-    with pytest.raises(HTTPException) as e2:
+    with pytest.raises(UnsupportedExerciseError):
         analyze_exercise_form("video.mp4", "unsupported_exercise")
-    assert e2.value.status_code == 400
 
 
 def test_chat_with_ai_video(mock_openai_client):
@@ -263,6 +246,7 @@ def test_process_video_real_time(
     assert count == 0
     assert mock_VideoCapture_instance.isOpened.called
     assert mock_VideoCapture_instance.read.called
+    mock_VideoCapture_instance.release.assert_called_once()
     assert mock_Pose.called
     assert mock_destroyAllWindows.called
     assert mock_cvtColor.called
@@ -344,7 +328,10 @@ async def test_update_user_records_success(mocker):
 
     email = "test@example.com"
     user_row = {"email": email, "squat": "[]", "bench_press": "[]", "deadlift": "[]"}
-    conn_mock.execute.return_value.fetchone.return_value = user_row
+    select_cursor = mocker.MagicMock()
+    select_cursor.fetchone.return_value = user_row
+    update_cursor = mocker.MagicMock()
+    conn_mock.execute.side_effect = [select_cursor, update_cursor]
 
     new_squat = 100.0
     new_bench_press = 150.0
