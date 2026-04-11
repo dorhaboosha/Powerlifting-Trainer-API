@@ -1,17 +1,31 @@
 """
-Powerlifting Trainer Assistant API — main application module.
+Powerlifting Trainer Assistant API - main application module.
 
-This module provides a FastAPI backend that:
-- Manages lifter profiles (registration, BMI, PR history for squat/bench/deadlift).
-- Analyzes exercise form via uploaded video or real-time webcam using MediaPipe.
-- Returns AI coaching feedback via OpenAI and optionally emails it via SMTP.
+This file is the single entry point for the HTTP API. Rough layout (top to bottom):
 
-Important: Real-time webcam analysis works only when running locally (not in Docker).
+    1. Configuration: environment variables, OpenAI client, SMTP settings, FastAPI app.
+    2. Persistence: SQLite helpers and the Users table (created on import).
+    3. HTTP routes: user registration/profile/records, then video analysis routes.
+    4. Video pipeline: MediaPipe pose helpers, domain exceptions, file-based analysis,
+       real-time webcam loop, OpenAI prompts, optional TTS and email.
+    5. ``if __name__ == "__main__"``: run uvicorn and optionally open /docs locally.
+
+Capabilities:
+    - Lifters: register, fetch profile, append PRs for squat / bench / deadlift (stored as JSON arrays).
+    - Video: upload ``.mp4`` for angle-based form hints, or use a local webcam for timed sessions.
+    - Coaching: OpenAI (``gpt-4o-mini``) turns metrics into text; SMTP can email that text.
+
+Environment variables are loaded from ``.env`` (see ``.env.example``). Important flags:
+
+    - ``RUNNING_IN_DOCKER``: when ``1``, disables OpenCV windows and blocks webcam mode.
+    - ``DB_PATH``, ``UPLOAD_DIR``, ``OPENAI_API_KEY``, ``SMTP_*``: see ``.env.example``.
+
+Real-time webcam analysis only works on a machine with a local camera (not typical in Docker/cloud).
 """
 
 import os
 
-# ✅ Must be set BEFORE importing mediapipe (prevents EGL/GL GPU issues)
+# Must be set BEFORE importing mediapipe (prevents EGL/GL GPU issues)
 os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
 
 import html
@@ -25,6 +39,7 @@ import webbrowser
 from email.message import EmailMessage
 from typing import Optional
 
+# Module logger: use logger.exception / logger.error for failures so stack traces appear in server logs.
 logger = logging.getLogger(__name__)
 
 import cv2
@@ -42,22 +57,26 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field, EmailStr
 
 # -------------------------
-# ✅ Env / runtime flags
+# Environment and paths
 # -------------------------
 load_dotenv()
 
+# Docker vs local: affects OpenCV display, webcam availability, and default bind address.
 RUNNING_IN_DOCKER = os.getenv("RUNNING_IN_DOCKER", "0") == "1"
+# SQLite file path; override in Docker if you mount a volume for persistence.
 DB_PATH = os.getenv("DB_PATH", "Users.db")
+# Uploaded videos are written here briefly, then removed after analysis.
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./tmp_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # -------------------------
-# ✅ OpenAI
+# OpenAI (coaching text)
 # -------------------------
+# API key must be set for video feedback endpoints to work.
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # -------------------------
-# ✅ SMTP Config (Gmail)
+# SMTP (optional email of feedback)
 # -------------------------
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -66,7 +85,7 @@ SMTP_PASS = os.getenv("SMTP_PASS")
 SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "Powerlifting Coach")
 
 # -------------------------
-# ✅ FastAPI metadata (Docs polish)
+# FastAPI app + OpenAPI tag descriptions (Swagger grouping)
 # -------------------------
 tags_metadata = [
     {
@@ -96,19 +115,17 @@ app = FastAPI(
 )
 
 # -------------------------
-# ✅ TTS (thread-safe)
+# Text-to-speech (real-time mode only; pyttsx3 is not thread-safe without a lock)
 # -------------------------
 tts_engine = pyttsx3.init()
 tts_lock = threading.Lock()
 
 
 # -------------------------
-# ✅ DB helpers
+# Database
 # -------------------------
 def get_db_connection() -> sqlite3.Connection:
-    """
-    Create and return a SQLite DB connection using DB_PATH.
-    """
+    """Open SQLite at ``DB_PATH`` and return a connection with dict-like rows (``sqlite3.Row``)."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
@@ -116,7 +133,10 @@ def get_db_connection() -> sqlite3.Connection:
 
 def create_users_table() -> None:
     """
-    Ensure the Users table exists.
+    Create the ``Users`` table if missing.
+
+    Called once at import time so the first request does not need to bootstrap schema.
+    Lift records (squat, bench, deadlift) are stored as JSON strings of number arrays.
     """
     conn = get_db_connection()
     conn.execute(
@@ -141,10 +161,10 @@ create_users_table()
 
 
 # -------------------------
-# ✅ Models
+# Request / response models (Pydantic)
 # -------------------------
 class User(BaseModel):
-    """User registration input model."""
+    """Payload for ``POST /users/register``: identity plus anthropometrics for BMI."""
 
     email: EmailStr
     height: float = Field(gt=0, description="Height in meters")
@@ -158,11 +178,11 @@ def calculate_bmi(height: float, weight: float) -> float:
 
 
 # -------------------------
-# ✅ Docs UX
+# Convenience routes (not listed in OpenAPI)
 # -------------------------
 @app.get("/", include_in_schema=False)
 def root_redirect_to_docs():
-    """Redirect root URL to Swagger docs."""
+    """Send browsers from ``/`` straight to the interactive Swagger UI."""
     return RedirectResponse(url="/docs")
 
 
@@ -173,7 +193,7 @@ def health_check():
 
 
 # ============================================================
-# ✅ NEW CLEAN ENDPOINTS (these appear in Swagger docs)
+# Public API (tagged in OpenAPI / Swagger)
 # ============================================================
 
 @app.post(
@@ -183,6 +203,7 @@ def health_check():
     description="Creates a user profile and stores BMI + empty record arrays (deadlift/squat/bench).",
 )
 async def register_user(user: User):
+    """Validate input, insert a row, or return 400 if email already exists (``IntegrityError``)."""
     if user.email == "user@example.com":
         raise HTTPException(status_code=400, detail="Invalid email address provided.")
     if user.height <= 0.5:
@@ -229,6 +250,7 @@ async def register_user(user: User):
     description="Fetches user profile (including record arrays) by email query parameter.",
 )
 async def get_user_profile(user_email: EmailStr):
+    """Return one user as JSON with ``deadlift`` / ``squat`` / ``bench_press`` parsed from JSON strings."""
     conn = get_db_connection()
     user = conn.execute("SELECT * FROM Users WHERE email = ?", (str(user_email),)).fetchone()
     conn.close()
@@ -256,6 +278,7 @@ async def update_user_records(
     new_squat: float = None,
     new_bench_press: float = None,
 ):
+    """Append any provided lifts to the user's arrays; omit a field to leave that lift unchanged."""
     conn = get_db_connection()
     user = conn.execute("SELECT * FROM Users WHERE email = ?", (str(email),)).fetchone()
 
@@ -296,8 +319,10 @@ async def update_user_records(
 
 
 # ============================================================
-# Video analysis domain exceptions (mapped to HTTP by routes)
+# Video analysis: domain exceptions
 # ============================================================
+# These keep ``analyze_exercise_form`` free of FastAPI imports. Routes map them to
+# ``HTTPException`` with appropriate status codes and ``from e`` chaining.
 
 
 class InvalidVideoFormatError(Exception):
@@ -317,8 +342,9 @@ class VideoProcessingError(Exception):
 
 
 # ============================================================
-# ✅ MediaPipe / Analysis helpers
+# MediaPipe pose + geometry helpers
 # ============================================================
+# Landmarks use normalized image coordinates; we only use the left-side chain for simplicity.
 mp_pose = mp.solutions.pose
 mp_drawing = mp.solutions.drawing_utils
 
@@ -329,6 +355,7 @@ def calculate_angle(a, b, c) -> float:
     b = np.array(b)
     c = np.array(c)
 
+    # atan2 gives signed angles in the plane; take absolute value and fold to [0, 180].
     radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
     angle = np.abs(radians * 180.0 / np.pi)
 
@@ -375,6 +402,7 @@ def analyze_exercise_form(video_path: str, exercise_type: str):
         raise UnsupportedExerciseError("Unsupported exercise type")
 
     cap = cv2.VideoCapture(video_path)
+    # Squat/bench: track minimum angle (deepest position). Deadlift: average frame angles.
     angles = []
     min_angle_squat = float("inf")
     min_angle_benchpress = float("inf")
@@ -404,6 +432,7 @@ def analyze_exercise_form(video_path: str, exercise_type: str):
                         angle = analyze_benchpress(landmarks)
                         min_angle_benchpress = min(min_angle_benchpress, angle)
 
+                    # Headless servers (e.g. Docker) skip imshow / waitKey to avoid GUI requirements.
                     if not RUNNING_IN_DOCKER:
                         mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
                         cv2.putText(frame, f"Angle: {angle:.2f} degrees", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
@@ -412,7 +441,7 @@ def analyze_exercise_form(video_path: str, exercise_type: str):
                             break
 
     except (InvalidVideoFormatError, UnsupportedExerciseError, NoPoseDetectedError):
-        raise
+        raise  # Already domain errors; do not wrap as VideoProcessingError
     except Exception as e:
         logger.exception("Video processing failed")
         raise VideoProcessingError("An error occurred during video processing.") from e
@@ -433,7 +462,7 @@ def analyze_exercise_form(video_path: str, exercise_type: str):
 
 
 def chat_with_ai_video(final_angle: float, exercise_type: str) -> str:
-    """Request OpenAI coaching feedback for the given measured angle and exercise type."""
+    """Build a short prompt from the numeric result and return the assistant reply (plain text)."""
     prompt = (
         f"I analyzed your {exercise_type} form.\n"
         f"Measured angle: {final_angle:.2f} degrees.\n"
@@ -457,7 +486,7 @@ def chat_with_ai_video(final_angle: float, exercise_type: str) -> str:
 
 
 def say_text(text: str) -> None:
-    """Speak the given text using TTS (thread-safe via tts_lock)."""
+    """Queue speech on the shared pyttsx3 engine; failures are logged and do not crash the caller."""
     try:
         with tts_lock:
             tts_engine.say(text)
@@ -468,9 +497,11 @@ def say_text(text: str) -> None:
 
 def process_video_real_time(duration: int, exercise_type: str) -> int:
     """
-    Real-time webcam processing:
-    - Only works locally (not in Docker/cloud)
-    - If webcam isn't available, returns a friendly message via HTTPException
+    Run the default camera until ``duration`` seconds elapse or the user presses ``q``.
+
+    Rep counting is a simple state machine: when joint angle drops below a lift-specific
+    threshold we mark a "good" phase; when it opens again we increment the rep count and reset.
+    Raises ``HTTPException`` 400 if Docker is detected or the camera cannot be opened.
     """
     webcam_msg = (
         "There is no connection to the webcam (available only when running locally). "
@@ -487,6 +518,7 @@ def process_video_real_time(duration: int, exercise_type: str) -> int:
 
     display_message_time = 0
     count = 0
+    # True after we have seen a "bottom" position; cleared after counting a rep.
     exercise_completed = False
     start_time = time.time()
 
@@ -532,11 +564,13 @@ def process_video_real_time(duration: int, exercise_type: str) -> int:
                 cv2.putText(frame_bgr, f"Angle: {angle:.2f}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
                 cv2.putText(frame_bgr, f"{label} Count: {count}", (30, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
 
+                # "Bottom" of the rep: angle below threshold; trigger TTS once per phase.
                 if angle < threshold_down and not exercise_completed:
                     display_message_time = time.time() + 5
                     exercise_completed = True
                     threading.Thread(target=say_text, args=(voice,), daemon=True).start()
 
+                # Return toward start position: count rep and wait for next descent.
                 if angle > threshold_up and exercise_completed:
                     count += 1
                     exercise_completed = False
@@ -560,8 +594,11 @@ def process_video_real_time(duration: int, exercise_type: str) -> int:
 
 async def email_sender(email: str, feedback_content: str) -> dict:
     """
-    Send feedback email via SMTP (works locally/Docker where SMTP is allowed).
-    If SMTP credentials are missing -> returns a message without failing the API.
+    Send ``feedback_content`` to ``email`` using ``aiosmtplib`` and STARTTLS.
+
+    Missing ``SMTP_USER`` / ``SMTP_PASS``: returns a dict explaining email was skipped (no raise).
+    Send failures are logged and surfaced as ``{"message": "Failed to send email"}``.
+    HTML part uses ``html.escape`` so user-supplied feedback cannot inject markup.
     """
     if not SMTP_USER or not SMTP_PASS:
         return {"message": "Email not sent (missing SMTP_USER / SMTP_PASS in .env)"}
@@ -599,7 +636,7 @@ async def email_sender(email: str, feedback_content: str) -> dict:
 
 
 def chat_with_ai_video_real_time(good_count: int, duration: int, exercise_type: str) -> str:
-    """Request OpenAI feedback based on rep count and duration from real-time webcam analysis."""
+    """Summarize webcam session (rep count + time window) and ask the model for short coaching tips."""
     chat_completion = client.chat.completions.create(
         messages=[
             {"role": "system", "content": "You are a professional powerlifting and strength training coach."},
@@ -626,10 +663,19 @@ async def video_process(
     Duration_in_real_time: Optional[int] = Form(0, description="Real-time duration in seconds (local only)"),
     email: EmailStr = Form(..., description="Recipient email for the feedback"),
 ):
+    """
+    Two mutually exclusive flows:
+
+    * **Upload:** save multipart file to ``UPLOAD_DIR``, analyze with MediaPipe, call OpenAI,
+      email result, and always delete the temp file in ``finally``.
+    * **Webcam:** require local run (not Docker); ``process_video_real_time`` counts reps for
+      ``Duration_in_real_time`` seconds, then OpenAI + email as above. ``HTTPException`` from
+      webcam setup propagates to the client (not converted to 200 JSON).
+    """
     if Exercise_type.lower() not in ["squat", "deadlift", "benchpress"]:
         raise HTTPException(status_code=400, detail="Invalid exercise type.")
 
-    # 1) Uploaded video path
+    # --- Branch A: file upload (.mp4 written to disk first) ---
     if Video is not None:
         temp_video_path = os.path.join(UPLOAD_DIR, f"temp_{Video.filename}")
         with open(temp_video_path, "wb") as buffer:
@@ -657,7 +703,7 @@ async def video_process(
         finally:
             os.remove(temp_video_path)
 
-    # 2) Real-time (webcam)
+    # --- Branch B: live camera for N seconds (local only) ---
     if Duration_in_real_time and Duration_in_real_time > 0:
         try:
             good_count = process_video_real_time(Duration_in_real_time, Exercise_type.lower())
@@ -674,45 +720,6 @@ async def video_process(
         }
 
     return {"message": "Please specify a positive duration or upload a video."}
-
-
-# ============================================================
-# ✅ OLD ENDPOINTS (kept for compatibility, hidden from docs)
-# ============================================================
-
-@app.post("/Registration", include_in_schema=False)
-async def old_register_user(user: User):
-    return await register_user(user)
-
-
-@app.get("/Show User", include_in_schema=False)
-async def old_get_user(user_email: EmailStr):
-    return await get_user_profile(user_email)
-
-
-@app.post("/Update Record Weight", include_in_schema=False)
-async def old_update_weight(
-    email: EmailStr,
-    new_deadlift: float = None,
-    new_squat: float = None,
-    new_bench_press: float = None,
-):
-    return await update_user_records(
-        email=email,
-        new_deadlift=new_deadlift,
-        new_squat=new_squat,
-        new_bench_press=new_bench_press,
-    )
-
-
-@app.post("/Video Processing", include_in_schema=False)
-async def old_video_processing(
-    Video: UploadFile = File(None),
-    Exercise_type: str = Form(...),
-    Duration_in_real_time: Optional[int] = Form(0),
-    email: EmailStr = Form(...),
-):
-    return await video_process(Video, Exercise_type, Duration_in_real_time, email)
 
 
 if __name__ == "__main__":

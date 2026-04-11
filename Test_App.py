@@ -1,12 +1,26 @@
 """
-Pytest suite for the Powerlifting Trainer Assistant API.
+Pytest suite for the Powerlifting Trainer Assistant API (``main`` module).
 
-Covers:
-- DB connection and user registration/profile/records
-- BMI and pose angle helpers (calculate_angle, analyze_squat/deadlift/benchpress)
-- Video form analysis and OpenAI coaching (mocked)
-- TTS and real-time webcam flow (mocked)
-- Email sender behavior (mocked)
+Rough layout (matches the order of tests below):
+
+    1. **HTTP + DB** - ``TestClient`` against the FastAPI ``app``; DB access is often
+       patched via ``mock_db_connection`` so CI never depends on a real ``Users.db``.
+    2. **Pure helpers** - BMI and geometry (``calculate_angle``) need no I/O.
+    3. **Pose helpers** - ``analyze_*`` functions use synthetic landmark lists (index =
+       MediaPipe landmark id) instead of loading video.
+    4. **OpenAI** - ``mock_openai_client`` stubs ``main.client.chat.completions.create``
+       so tests never call the network.
+    5. **Webcam path** - OpenCV and MediaPipe are patched; ``RUNNING_IN_DOCKER`` may be
+       forced off so ``process_video_real_time`` exercises the happy path without a camera.
+    6. **Email** - ``aiosmtplib.send`` is patched; ``SMTP_USER`` / ``SMTP_PASS`` on
+       ``main`` are set so ``email_sender`` does not short-circuit early.
+    7. **Records update** - ``get_db_connection`` returns a mock; ``execute`` uses
+       ``side_effect`` so SELECT and UPDATE get distinct cursor mocks.
+
+From the project root, run ``pytest Test_App.py -v``.
+
+``load_dotenv()`` loads your ``.env`` for any test that still touches real config;
+most tests isolate behavior with mocks or in-memory-friendly paths.
 """
 
 from dotenv import load_dotenv
@@ -37,17 +51,24 @@ from main import (
 
 load_dotenv()
 
+# Shared ASGI client: same app instance as production, but requests never bind a real port.
 client = TestClient(app)
 
 
-# -------------------------
-# DB and app client
-# -------------------------
+# =============================================================================
+# Database wiring and HTTP smoke tests
+# =============================================================================
 
 
 @pytest.fixture
 def mock_db_connection(mocker):
-    """Patch main.get_db_connection so tests use a mock connection instead of a real DB."""
+    """
+    Replace ``main.get_db_connection`` with a ``MagicMock`` connection.
+
+    Route handlers call ``get_db_connection`` on the ``main`` module, so patching
+    ``main.get_db_connection`` keeps registration tests off disk while still
+    exercising FastAPI validation and response shape.
+    """
     mocker.patch("main.get_db_connection", return_value=MagicMock(spec=sqlite3.Connection))
 
 
@@ -59,7 +80,7 @@ def test_get_db_connection(mock_db_connection):
 
 
 def test_calculate_bmi():
-    """BMI for height 1.75 m and weight 75 kg is 24.49."""
+    """``calculate_bmi`` uses weight / height^2 rounded to two decimals (SI units)."""
     height = 1.75
     weight = 75
     expected_bmi = 24.49
@@ -68,9 +89,9 @@ def test_calculate_bmi():
 
 
 def test_register_user(mock_db_connection):
-    """POST /Registration with valid payload creates user and returns welcome message (uses mocked DB)."""
+    """POST /users/register with valid payload creates user and returns welcome message (uses mocked DB)."""
     response = client.post(
-        "/Registration",
+        "/users/register",
         json={
             "email": "test@example.com",
             "height": 1.75,
@@ -84,14 +105,24 @@ def test_register_user(mock_db_connection):
 
 
 def test_get_user_not_found():
-    """GET /Show User for unknown email returns 404."""
+    """
+    ``GET /users/profile`` with a non-existent ``user_email`` yields 404.
+
+    Uses the real DB path unless you add a similar patch fixture; keep the email
+    obviously synthetic to avoid colliding with local dev data.
+    """
     test_email = "NotExists@example.com"
-    response = client.get(f"/Show User?user_email={test_email}")
+    response = client.get(f"/users/profile?user_email={test_email}")
     assert response.status_code == 404
 
 
+# =============================================================================
+# Geometry: calculate_angle (no MediaPipe)
+# =============================================================================
+
+
 def test_calculate_angle_degrees():
-    """Angle at (1,0) between (0,0)-(1,0) and (1,0)-(1,1) is 90 degrees."""
+    """Right angle at ``b`` for an L-shaped triple of 2D points in the plane."""
     a = [0, 0]
     b = [1, 0]
     c = [1, 1]
@@ -101,8 +132,13 @@ def test_calculate_angle_degrees():
     assert calculated_angle == expected_angle
 
 
+# =============================================================================
+# Pose landmark helpers (synthetic 33-element landmark lists)
+# =============================================================================
+
+
 def mock_landmark(x, y):
-    """Build a MagicMock pose landmark with .x and .y for angle tests."""
+    """Minimal stand-in for one MediaPipe landmark (normalized x, y only)."""
     lm = MagicMock()
     lm.x = x
     lm.y = y
@@ -110,7 +146,7 @@ def mock_landmark(x, y):
 
 
 def test_analyze_squat():
-    """analyze_squat(landmarks) matches manual calculate_angle(hip, knee, ankle)."""
+    """``analyze_squat`` must agree with ``calculate_angle`` on the same three points."""
     hip = mock_landmark(0.5, 0.5)
     knee = mock_landmark(0.5, 0.6)
     ankle = mock_landmark(0.5, 0.7)
@@ -127,7 +163,7 @@ def test_analyze_squat():
 
 
 def test_analyze_deadlift():
-    """analyze_deadlift(landmarks) matches manual calculate_angle(shoulder, hip, knee)."""
+    """``analyze_deadlift`` uses shoulder-hip-knee; compare to explicit ``calculate_angle``."""
     shoulder = mock_landmark(0.5, 0.4)
     hip = mock_landmark(0.5, 0.5)
     knee = mock_landmark(0.5, 0.6)
@@ -144,7 +180,7 @@ def test_analyze_deadlift():
 
 
 def test_analyze_benchpress():
-    """analyze_benchpress(landmarks) matches manual calculate_angle(wrist, elbow, shoulder)."""
+    """``analyze_benchpress`` uses wrist-elbow-shoulder; compare to ``calculate_angle``."""
     wrist = mock_landmark(0.4, 0.5)
     elbow = mock_landmark(0.5, 0.5)
     shoulder = mock_landmark(0.6, 0.5)
@@ -160,9 +196,19 @@ def test_analyze_benchpress():
     assert calculated_angle == pytest.approx(expected_angle)
 
 
+# =============================================================================
+# Video analysis validation and OpenAI (network-free)
+# =============================================================================
+
+
 @pytest.fixture
 def mock_openai_client(mocker):
-    """Patch OpenAI chat completions to return a fixed 'Mocked AI response'."""
+    """
+    Stub the OpenAI client so ``chat_with_ai_video`` returns predictable text.
+
+    Patches ``main.client`` (module-level singleton), not a local import inside
+    the function under test.
+    """
     mocker.patch(
         "main.client.chat.completions.create",
         return_value=MagicMock(choices=[MagicMock(message=MagicMock(content="Mocked AI response"))]),
@@ -170,7 +216,13 @@ def mock_openai_client(mocker):
 
 
 def test_analyze_exercise_form_invalid_input(mock_openai_client):
-    """analyze_exercise_form raises domain errors for None video or unsupported exercise type."""
+    """
+    ``analyze_exercise_form`` raises domain exceptions (not ``HTTPException``).
+
+    Routes translate these to HTTP status codes; this test calls the pure function
+    directly. The OpenAI fixture is unused here but keeps the suite consistent
+    if you merge video tests later.
+    """
     with pytest.raises(InvalidVideoFormatError) as e:
         analyze_exercise_form(None, "squat")
     assert "Invalid video format" in str(e.value)
@@ -180,16 +232,21 @@ def test_analyze_exercise_form_invalid_input(mock_openai_client):
 
 
 def test_chat_with_ai_video(mock_openai_client):
-    """chat_with_ai_video returns the mocked OpenAI response."""
+    """End-to-end string from ``chat_with_ai_video`` equals the stubbed completion content."""
     final_angle = 45
     exercise_type = "squat"
     response = chat_with_ai_video(final_angle, exercise_type)
     assert response == "Mocked AI response"
 
 
+# =============================================================================
+# Text-to-speech and real-time webcam (heavy deps mocked)
+# =============================================================================
+
+
 @patch("main.tts_engine")
 def test_say_text(mock_tts_engine):
-    """say_text calls the module-level tts_engine say and runAndWait with the given text."""
+    """Patch ``main.tts_engine`` (not ``pyttsx3.init``) because ``say_text`` uses the module singleton."""
     text = "This is a test message."
     say_text(text)
     mock_tts_engine.say.assert_called_once_with(text)
@@ -217,8 +274,14 @@ def test_process_video_real_time(
     mock_draw_landmarks,
     monkeypatch,
 ):
-    """With VideoCapture/Pose/cv2 mocked, process_video_real_time runs and uses capture, pose, draw, and cleanup."""
-    # Force local mode for this test, regardless of your real .env
+    """
+    Exercise ``process_video_real_time`` without a camera or GUI.
+
+    Patches are applied bottom-to-top in the decorator order (innermost first
+    argument). ``Pose`` must mock ``__enter__`` because production code uses
+    ``with mp_pose.Pose(...) as pose``.
+    """
+    # Otherwise the handler returns 400 immediately in Docker-oriented CI envs.
     monkeypatch.setattr(main, "RUNNING_IN_DOCKER", False)
 
     mock_calculate_angle.return_value = 45.0
@@ -239,7 +302,7 @@ def test_process_video_real_time(
     mock_pose_instance.process.return_value = mock_results
     mock_pose_instance.POSE_CONNECTIONS = [(15, 21)]
 
-    duration = 1
+    duration = 1  # Unused for loop exit here; ``isOpened`` side_effect ends the loop first
     exercise_type = "squat"
     count = main.process_video_real_time(duration, exercise_type)
 
@@ -255,7 +318,7 @@ def test_process_video_real_time(
 
 
 def test_process_video_real_time_blocks_in_docker(monkeypatch):
-    """When RUNNING_IN_DOCKER=True, real-time webcam flow is blocked with a friendly 400."""
+    """Docker flag should surface ``HTTPException`` 400 before opening device index 0."""
     monkeypatch.setattr(main, "RUNNING_IN_DOCKER", True)
     with pytest.raises(HTTPException) as e:
         main.process_video_real_time(1, "squat")
@@ -263,15 +326,21 @@ def test_process_video_real_time_blocks_in_docker(monkeypatch):
     assert "webcam" in e.value.detail.lower() or "connection" in e.value.detail.lower()
 
 
-# -------------------------
-# Email tests (main uses aiosmtplib.send + SMTP_*)
-# -------------------------
+# =============================================================================
+# Async email (aiosmtplib)
+# =============================================================================
+# Production code reads ``SMTP_USER`` / ``SMTP_PASS`` from module-level names set
+# at import from ``os.getenv``; tests override those attributes on ``main``.
 
 
 @pytest.mark.asyncio
 @patch("main.aiosmtplib.send")
 async def test_email_sender_success(mock_send, monkeypatch):
-    """With aiosmtplib.send mocked and SMTP credentials set, email_sender returns success and send is called."""
+    """
+    Happy path: ``aiosmtplib.send`` succeeds; assert kwargs (host, user) and headers.
+
+    The first positional arg to ``send`` is an ``EmailMessage`` (plain + HTML parts).
+    """
     monkeypatch.setattr(main, "SMTP_USER", "test@example.com")
     monkeypatch.setattr(main, "SMTP_PASS", "testpass")
 
@@ -295,7 +364,7 @@ async def test_email_sender_success(mock_send, monkeypatch):
 @pytest.mark.asyncio
 @patch("main.aiosmtplib.send")
 async def test_email_sender_failure(mock_send, monkeypatch):
-    """When aiosmtplib.send raises, email_sender returns failure message."""
+    """Network or server errors are logged; API still returns a soft failure dict (no raise)."""
     monkeypatch.setattr(main, "SMTP_USER", "test@example.com")
     monkeypatch.setattr(main, "SMTP_PASS", "testpass")
     mock_send.side_effect = Exception("SMTP error")
@@ -309,7 +378,7 @@ async def test_email_sender_failure(mock_send, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_email_sender_missing_credentials(monkeypatch):
-    """When SMTP_USER or SMTP_PASS is missing, email_sender returns without calling aiosmtplib.send."""
+    """Missing creds short-circuit before ``send``; ensures we never open a socket with empty auth."""
     with patch("main.aiosmtplib.send") as mock_send:
         monkeypatch.setattr(main, "SMTP_USER", None)
         monkeypatch.setattr(main, "SMTP_PASS", "x")
@@ -320,9 +389,19 @@ async def test_email_sender_missing_credentials(monkeypatch):
         mock_send.assert_not_called()
 
 
+# =============================================================================
+# User records (async route handler with mocked SQLite)
+# =============================================================================
+
+
 @pytest.mark.asyncio
 async def test_update_user_records_success(mocker):
-    """update_user_records with valid user and new PRs updates DB and returns success."""
+    """
+    ``update_user_records`` SELECTs, mutates JSON arrays, then UPDATEs.
+
+    Two different cursor mocks avoid reusing the same ``fetchone`` return for
+    both statements (closer to real sqlite3 behavior).
+    """
     conn_mock = mocker.MagicMock()
     mocker.patch("main.get_db_connection", return_value=conn_mock)
 
